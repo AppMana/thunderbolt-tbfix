@@ -10,6 +10,7 @@
  */
 
 #include <linux/atomic.h>
+#include <linux/ethtool.h>
 #include <linux/highmem.h>
 #include <linux/if_vlan.h>
 #include <linux/jhash.h>
@@ -30,7 +31,8 @@
 #define TBNET_LOGIN_TIMEOUT	500
 #define TBNET_LOGOUT_TIMEOUT	1000
 
-#define TBNET_RING_SIZE		256
+#define TBNET_RING_SIZE		2048
+#define TBNET_DEFAULT_INT_COALESCE_USECS 128
 #define TBNET_LOGIN_RETRIES	60
 #define TBNET_LOGOUT_RETRIES	10
 #define TBNET_E2E		BIT(0)
@@ -47,6 +49,8 @@
 #define TBNET_RX_PAGE_SIZE	(PAGE_SIZE << TBNET_RX_PAGE_ORDER)
 
 #define TBNET_L0_PORT_NUM(route) ((route) & GENMASK(5, 0))
+
+int tb_ring_throttling(struct tb_ring *ring, unsigned int interval_nsec);
 
 /**
  * struct thunderbolt_ip_frame_header - Header for each Thunderbolt frame
@@ -173,6 +177,7 @@ struct tbnet_ring {
  *	    network packet consists of multiple Thunderbolt frames.
  *	    In host byte order.
  * @rx_ring: Software ring holding Rx frames
+ * @int_coalesce_usecs: Ring interrupt coalescing interval in usec
  * @frame_id: Frame ID use for next Tx packet
  *            (if %TBNET_MATCH_FRAGS_ID is supported in both ends)
  * @tx_ring: Software ring holding Tx frames
@@ -197,6 +202,7 @@ struct tbnet {
 	struct work_struct disconnect_work;
 	struct thunderbolt_ip_frame_header rx_hdr;
 	struct tbnet_ring rx_ring;
+	unsigned int int_coalesce_usecs;
 	atomic_t frame_id;
 	struct tbnet_ring tx_ring;
 };
@@ -921,6 +927,7 @@ static int tbnet_open(struct net_device *dev)
 	struct tb_ring *ring;
 	unsigned int flags;
 	int hopid;
+	int ret;
 
 	netif_carrier_off(dev);
 
@@ -960,10 +967,28 @@ static int tbnet_open(struct net_device *dev)
 	}
 	net->rx_ring.ring = ring;
 
+	ret = tb_ring_throttling(net->tx_ring.ring,
+				 net->int_coalesce_usecs * NSEC_PER_USEC);
+	if (ret)
+		goto err_free_rx_ring;
+
+	ret = tb_ring_throttling(net->rx_ring.ring,
+				 net->int_coalesce_usecs * NSEC_PER_USEC);
+	if (ret)
+		goto err_free_rx_ring;
+
 	napi_enable(&net->napi);
 	start_login(net);
 
 	return 0;
+
+err_free_rx_ring:
+	tb_ring_free(net->rx_ring.ring);
+	net->rx_ring.ring = NULL;
+	tb_xdomain_release_out_hopid(xd, hopid);
+	tb_ring_free(net->tx_ring.ring);
+	net->tx_ring.ring = NULL;
+	return ret;
 }
 
 static int tbnet_stop(struct net_device *dev)
@@ -1264,6 +1289,46 @@ static const struct net_device_ops tbnet_netdev_ops = {
 	.ndo_get_stats64 = tbnet_get_stats64,
 };
 
+static int tbnet_get_coalesce(struct net_device *dev,
+			      struct ethtool_coalesce *ec,
+			      struct kernel_ethtool_coalesce *kernel_ec,
+			      struct netlink_ext_ack *extack)
+{
+	const struct tbnet *net = netdev_priv(dev);
+
+	ec->rx_coalesce_usecs = net->int_coalesce_usecs;
+	ec->tx_coalesce_usecs = net->int_coalesce_usecs;
+
+	return 0;
+}
+
+static int tbnet_set_coalesce(struct net_device *dev,
+			      struct ethtool_coalesce *ec,
+			      struct kernel_ethtool_coalesce *kernel_ec,
+			      struct netlink_ext_ack *extack)
+{
+	struct tbnet *net = netdev_priv(dev);
+
+	if (ec->rx_coalesce_usecs != ec->tx_coalesce_usecs)
+		return -EINVAL;
+
+	if (netif_running(dev)) {
+		NL_SET_ERR_MSG_MOD(extack,
+				   "interrupt coalescing can be changed only while the interface is down");
+		return -EBUSY;
+	}
+
+	net->int_coalesce_usecs = ec->rx_coalesce_usecs;
+	return 0;
+}
+
+static const struct ethtool_ops tbnet_ethtool_ops = {
+	.supported_coalesce_params = ETHTOOL_COALESCE_RX_USECS |
+				     ETHTOOL_COALESCE_TX_USECS,
+	.get_coalesce = tbnet_get_coalesce,
+	.set_coalesce = tbnet_set_coalesce,
+};
+
 static void tbnet_generate_mac(struct net_device *dev)
 {
 	const struct tbnet *net = netdev_priv(dev);
@@ -1311,6 +1376,7 @@ static int tbnet_probe(struct tb_service *svc, const struct tb_service_id *id)
 
 	strcpy(dev->name, "thunderbolt%d");
 	dev->netdev_ops = &tbnet_netdev_ops;
+	dev->ethtool_ops = &tbnet_ethtool_ops;
 
 	/* ThunderboltIP takes advantage of TSO packets but instead of
 	 * segmenting them we just split the packet into Thunderbolt
@@ -1330,7 +1396,7 @@ static int tbnet_probe(struct tb_service *svc, const struct tb_service_id *id)
 	dev->features = dev->hw_features | NETIF_F_HIGHDMA;
 	dev->hard_header_len += sizeof(struct thunderbolt_ip_frame_header);
 
-	netif_napi_add(dev, &net->napi, tbnet_poll);
+	netif_napi_add_weight(dev, &net->napi, tbnet_poll, 256);
 
 	/* MTU range: 68 - 65522 */
 	dev->min_mtu = ETH_MIN_MTU;
@@ -1339,6 +1405,7 @@ static int tbnet_probe(struct tb_service *svc, const struct tb_service_id *id)
 	net->handler.uuid = &tbnet_svc_uuid;
 	net->handler.callback = tbnet_handle_packet;
 	net->handler.data = net;
+	net->int_coalesce_usecs = TBNET_DEFAULT_INT_COALESCE_USECS;
 	tb_register_protocol_handler(&net->handler);
 
 	tb_service_set_drvdata(svc, net);

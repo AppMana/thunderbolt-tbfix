@@ -50,6 +50,8 @@ static bool host_reset = true;
 module_param(host_reset, bool, 0444);
 MODULE_PARM_DESC(host_reset, "reset USB4 host router (default: true)");
 
+int tb_ring_throttling(struct tb_ring *ring, unsigned int interval_nsec);
+
 static int ring_interrupt_index(const struct tb_ring *ring)
 {
 	int bit = ring->hop;
@@ -162,6 +164,7 @@ static void ring_interrupt_active(struct tb_ring *ring, bool active)
 static void nhi_disable_interrupts(struct tb_nhi *nhi)
 {
 	int i = 0;
+
 	/* disable interrupts */
 	for (i = 0; i < RING_INTERRUPT_REG_COUNT(nhi); i++)
 		nhi_mask_interrupt(nhi, ~0, 4 * i);
@@ -172,6 +175,17 @@ static void nhi_disable_interrupts(struct tb_nhi *nhi)
 }
 
 /* ring helper methods */
+
+static void ring_interrupt_clear(struct tb_ring *ring)
+{
+	int bit = ring_interrupt_index(ring) & 31;
+	int reg = REG_RING_INT_CLEAR;
+
+	if (!ring->is_tx)
+		reg += 4 * (ring->nhi->hop_count / 32);
+
+	iowrite32(BIT(bit), ring->nhi->iobase + reg);
+}
 
 static void __iomem *ring_desc_base(struct tb_ring *ring)
 {
@@ -386,11 +400,15 @@ static void __ring_interrupt_mask(struct tb_ring *ring, bool mask)
 	u32 val;
 
 	val = ioread32(ring->nhi->iobase + reg);
-	if (mask)
+	if (mask) {
 		val &= ~BIT(bit);
-	else
+		iowrite32(val, ring->nhi->iobase + reg);
+	} else {
+		if (!(ring->nhi->quirks & QUIRK_AUTO_CLEAR_INT))
+			ring_interrupt_clear(ring);
 		val |= BIT(bit);
-	iowrite32(val, ring->nhi->iobase + reg);
+		iowrite32(val, ring->nhi->iobase + reg);
+	}
 }
 
 /* Both @nhi->lock and @ring->lock should be held */
@@ -420,12 +438,62 @@ void tb_ring_poll_complete(struct tb_ring *ring)
 
 	spin_lock_irqsave(&ring->nhi->lock, flags);
 	spin_lock(&ring->lock);
-	if (ring->start_poll)
+	/*
+	 * Unconditionally re-enable the ring's interrupt when the ring
+	 * is running. The previous guard on @start_poll could leave a
+	 * ring masked if start_poll was observed NULL at poll-complete
+	 * time while the paired mask (set unconditionally in the ISR
+	 * path via __ring_interrupt) persisted.  Under concurrent two-
+	 * port load on a Maple Ridge transit, this race is reproducible
+	 * and manifests as a silent wedge: one bit in
+	 * REG_RING_INTERRUPT_BASE stays cleared and MSI-X stops.
+	 *
+	 * The ioread32() after __ring_interrupt_mask() flushes the
+	 * posted write so the enable actually reaches the hardware
+	 * before we drop the lock.
+	 */
+	if (ring->running) {
 		__ring_interrupt_mask(ring, false);
+		/* Flush the posted interrupt-enable write before unlock. */
+		ioread32(ring->nhi->iobase + REG_RING_INTERRUPT_BASE);
+	}
 	spin_unlock(&ring->lock);
 	spin_unlock_irqrestore(&ring->nhi->lock, flags);
 }
 EXPORT_SYMBOL_GPL(tb_ring_poll_complete);
+
+/**
+ * tb_ring_throttling() - Configure throttling for ring interrupt
+ * @ring: Ring to configure
+ * @interval_nsec: Interval counter for moderation in ns, %0 disables
+ *
+ * Enables or disables ring interrupt throttling. The ring must be stopped
+ * for this to be called. Granularity is 256 ns.
+ *
+ * Return: %0 on success, negative errno otherwise.
+ */
+int tb_ring_throttling(struct tb_ring *ring, unsigned int interval_nsec)
+{
+	unsigned long flags;
+	u32 throttle;
+
+	spin_lock_irqsave(&ring->lock, flags);
+	if (ring->running) {
+		spin_unlock_irqrestore(&ring->lock, flags);
+		return -EBUSY;
+	}
+
+	if (ring->irq > 0) {
+		throttle = DIV_ROUND_UP(interval_nsec, 256);
+		throttle &= REG_INT_THROTTLING_RATE_INTERVAL_MASK;
+		iowrite32(throttle, ring->nhi->iobase +
+			  REG_INT_THROTTLING_RATE + ring->vector * 4);
+	}
+	spin_unlock_irqrestore(&ring->lock, flags);
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(tb_ring_throttling);
 
 static void ring_clear_msix(const struct tb_ring *ring)
 {
@@ -1527,6 +1595,8 @@ static struct pci_device_id nhi_ids[] = {
 	{ PCI_VDEVICE(INTEL, PCI_DEVICE_ID_INTEL_PTL_P_NHI0),
 	  .driver_data = (kernel_ulong_t)&icl_nhi_ops },
 	{ PCI_VDEVICE(INTEL, PCI_DEVICE_ID_INTEL_PTL_P_NHI1),
+	  .driver_data = (kernel_ulong_t)&icl_nhi_ops },
+	{ PCI_VDEVICE(INTEL, PCI_DEVICE_ID_INTEL_WCL_NHI0),
 	  .driver_data = (kernel_ulong_t)&icl_nhi_ops },
 	{ PCI_VDEVICE(INTEL, PCI_DEVICE_ID_INTEL_BARLOW_RIDGE_HOST_80G_NHI) },
 	{ PCI_VDEVICE(INTEL, PCI_DEVICE_ID_INTEL_BARLOW_RIDGE_HOST_40G_NHI) },
