@@ -1,13 +1,14 @@
 # forks-thunderbolt
 
-AppMana fork of the Linux kernel `drivers/thunderbolt` and
-`drivers/net/thunderbolt` subsystems with two patches that fix a silent
-wedge under sustained two-port NCCL load on a 3-node Thunderbolt chain.
+AppMana fork of the Linux kernel Thunderbolt drivers. The fleet branch
+contains two independent workstreams: Thunderbolt networking fixes for
+the 3-node NCCL chain and ICM/PCIe hotplug diagnostics for HP FlexIO
+Thunderbolt storage.
 
 ```
 upstream  = git://git.kernel.org/pub/scm/linux/kernel/git/westeri/thunderbolt.git
 origin    = git@github.com:AppMana/forks-thunderbolt.git
-branch    = tbfix/v6.17        (deployed on the AppMana fleet)
+branch    = pub/tbfix-v6.17    (deployed on the AppMana fleet)
 base      = v6.17 + 3 backports already in linux-hwe-6.17
 ```
 
@@ -35,16 +36,22 @@ Read `docs/thunderbolt_fix.md` in the parent `appmana` repo. It covers:
 4. Deploying via Ansible (`playbook_worker.yaml`).
 5. Reverting to in-tree drivers.
 6. Rebasing on a newer kernel when the fleet bumps.
-7. Sending the patches upstream via `git send-email`.
+7. Preparing upstream topic patches for manual review.
 
 ## Branches
 
-- `tbfix/v6.17` — the deployed branch. Three commits on top of `v6.17`:
-  - `e0598358ba01 backport: Ubuntu HWE 6.17 kernel-source thunderbolt deltas`
-  - `c0350c90d0d1 thunderbolt: drop start_poll guard in tb_ring_poll_complete()`  ← H6 + H7
-  - `c35e822e5e6c net: thunderbolt: enlarge RX/TX ring and set NAPI weight ...`    ← H5 + H5a
-  Plus an overlay commit adding `dkms/`, `scripts/`, `tests/`, `README.md`.
+- `pub/tbfix-v6.17` — deployed DKMS branch. Includes the Ubuntu HWE
+  backport alignment, Thunderbolt networking/ring reliability work,
+  DKMS packaging, and ICM hotplug diagnostics.
+- `pub/tbfix-v6.17-hotplug` — storage-hotplug split branch. Carries
+  only the `drivers/thunderbolt/icm.c` hotplug work on top of the DKMS
+  packaging point; no `drivers/net/thunderbolt` changes.
 - `master` — local mirror of `upstream/master` (Mika Westerberg's tree).
+
+Do not submit the fleet branch upstream. For upstream work, create a
+fresh topic branch from `upstream/master` and apply only the minimal
+subsystem-specific change. Thunderbolt networking changes touch netdev;
+storage hotplug changes should not.
 
 ## Why patches not a submodule
 
