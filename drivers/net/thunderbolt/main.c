@@ -14,6 +14,7 @@
 #include <linux/highmem.h>
 #include <linux/if_vlan.h>
 #include <linux/jhash.h>
+#include <linux/log2.h>
 #include <linux/module.h>
 #include <linux/etherdevice.h>
 #include <linux/rtnetlink.h>
@@ -31,7 +32,9 @@
 #define TBNET_LOGIN_TIMEOUT	500
 #define TBNET_LOGOUT_TIMEOUT	1000
 
-#define TBNET_RING_SIZE		2048
+#define TBNET_MIN_RING_SIZE	256
+#define TBNET_DEFAULT_RING_SIZE	2048
+#define TBNET_MAX_RING_SIZE	4096
 #define TBNET_DEFAULT_INT_COALESCE_USECS 128
 #define TBNET_LOGIN_RETRIES	60
 #define TBNET_LOGOUT_RETRIES	10
@@ -143,7 +146,8 @@ struct tbnet_frame {
 };
 
 struct tbnet_ring {
-	struct tbnet_frame frames[TBNET_RING_SIZE];
+	struct tbnet_frame *frames;
+	unsigned int size;
 	unsigned int cons;
 	unsigned int prod;
 	struct tb_ring *ring;
@@ -177,10 +181,12 @@ struct tbnet_ring {
  *	    network packet consists of multiple Thunderbolt frames.
  *	    In host byte order.
  * @rx_ring: Software ring holding Rx frames
+ * @rx_ring_size: Configured Rx ring size
  * @int_coalesce_usecs: Ring interrupt coalescing interval in usec
  * @frame_id: Frame ID use for next Tx packet
  *            (if %TBNET_MATCH_FRAGS_ID is supported in both ends)
  * @tx_ring: Software ring holding Tx frames
+ * @tx_ring_size: Configured Tx ring size
  */
 struct tbnet {
 	const struct tb_service *svc;
@@ -202,9 +208,11 @@ struct tbnet {
 	struct work_struct disconnect_work;
 	struct thunderbolt_ip_frame_header rx_hdr;
 	struct tbnet_ring rx_ring;
+	unsigned int rx_ring_size;
 	unsigned int int_coalesce_usecs;
 	atomic_t frame_id;
 	struct tbnet_ring tx_ring;
+	unsigned int tx_ring_size;
 };
 
 /* Network property directory UUID: c66189ca-1cce-4195-bdb8-49592e5f5a4f */
@@ -341,7 +349,7 @@ static void tbnet_free_buffers(struct tbnet_ring *ring)
 {
 	unsigned int i;
 
-	for (i = 0; i < TBNET_RING_SIZE; i++) {
+	for (i = 0; i < ring->size; i++) {
 		struct device *dma_dev = tb_ring_dma_device(ring->ring);
 		struct tbnet_frame *tf = &ring->frames[i];
 		enum dma_data_direction dir;
@@ -509,7 +517,7 @@ static int tbnet_alloc_rx_buffers(struct tbnet *net, unsigned int nbuffers)
 
 	while (nbuffers--) {
 		struct device *dma_dev = tb_ring_dma_device(ring->ring);
-		unsigned int index = ring->prod & (TBNET_RING_SIZE - 1);
+		unsigned int index = ring->prod & (ring->size - 1);
 		struct tbnet_frame *tf = &ring->frames[index];
 		dma_addr_t dma_addr;
 
@@ -561,7 +569,7 @@ static struct tbnet_frame *tbnet_get_tx_buffer(struct tbnet *net)
 	if (!tbnet_available_buffers(ring))
 		return NULL;
 
-	index = ring->cons++ & (TBNET_RING_SIZE - 1);
+	index = ring->cons++ & (ring->size - 1);
 
 	tf = &ring->frames[index];
 	tf->frame.size = 0;
@@ -581,7 +589,7 @@ static void tbnet_tx_callback(struct tb_ring *ring, struct ring_frame *frame,
 	/* Return buffer to the ring */
 	net->tx_ring.prod++;
 
-	if (tbnet_available_buffers(&net->tx_ring) >= TBNET_RING_SIZE / 2)
+	if (tbnet_available_buffers(&net->tx_ring) >= net->tx_ring.size / 2)
 		netif_wake_queue(net->dev);
 }
 
@@ -591,7 +599,7 @@ static int tbnet_alloc_tx_buffers(struct tbnet *net)
 	struct device *dma_dev = tb_ring_dma_device(ring->ring);
 	unsigned int i;
 
-	for (i = 0; i < TBNET_RING_SIZE; i++) {
+	for (i = 0; i < ring->size; i++) {
 		struct tbnet_frame *tf = &ring->frames[i];
 		dma_addr_t dma_addr;
 
@@ -620,7 +628,7 @@ static int tbnet_alloc_tx_buffers(struct tbnet *net)
 	}
 
 	ring->cons = 0;
-	ring->prod = TBNET_RING_SIZE - 1;
+	ring->prod = ring->size - 1;
 
 	return 0;
 }
@@ -659,7 +667,7 @@ static void tbnet_connected_work(struct work_struct *work)
 	tb_ring_start(net->tx_ring.ring);
 	tb_ring_start(net->rx_ring.ring);
 
-	ret = tbnet_alloc_rx_buffers(net, TBNET_RING_SIZE);
+	ret = tbnet_alloc_rx_buffers(net, net->rx_ring.size);
 	if (ret)
 		goto err_stop_rings;
 
@@ -793,7 +801,7 @@ static bool tbnet_check_frame(struct tbnet *net, const struct tbnet_frame *tf,
 	}
 
 	/* Start of packet, validate the frame header */
-	if (frame_count == 0 || frame_count > TBNET_RING_SIZE / 4) {
+	if (frame_count == 0 || frame_count > net->rx_ring.size / 4) {
 		net->stats.rx_length_errors++;
 		return false;
 	}
@@ -930,16 +938,30 @@ static int tbnet_open(struct net_device *dev)
 	int ret;
 
 	netif_carrier_off(dev);
+	net->tx_ring.size = net->tx_ring_size;
+	net->rx_ring.size = net->rx_ring_size;
+	net->tx_ring.frames = kcalloc(net->tx_ring.size,
+				      sizeof(*net->tx_ring.frames), GFP_KERNEL);
+	if (!net->tx_ring.frames)
+		return -ENOMEM;
+
+	net->rx_ring.frames = kcalloc(net->rx_ring.size,
+				      sizeof(*net->rx_ring.frames), GFP_KERNEL);
+	if (!net->rx_ring.frames) {
+		ret = -ENOMEM;
+		goto err_free_tx_frames;
+	}
 
 	flags = RING_FLAG_FRAME;
 	/* Only enable full E2E if the other end supports it too */
 	if (tbnet_e2e && net->svc->prtcstns & TBNET_E2E)
 		flags |= RING_FLAG_E2E;
 
-	ring = tb_ring_alloc_tx(xd->tb->nhi, -1, TBNET_RING_SIZE, flags);
+	ring = tb_ring_alloc_tx(xd->tb->nhi, -1, net->tx_ring.size, flags);
 	if (!ring) {
 		netdev_err(dev, "failed to allocate Tx ring\n");
-		return -ENOMEM;
+		ret = -ENOMEM;
+		goto err_free_rx_frames;
 	}
 	net->tx_ring.ring = ring;
 
@@ -948,14 +970,15 @@ static int tbnet_open(struct net_device *dev)
 		netdev_err(dev, "failed to allocate Tx HopID\n");
 		tb_ring_free(net->tx_ring.ring);
 		net->tx_ring.ring = NULL;
-		return hopid;
+		ret = hopid;
+		goto err_free_rx_frames;
 	}
 	net->local_transmit_path = hopid;
 
 	sof_mask = BIT(TBIP_PDF_FRAME_START);
 	eof_mask = BIT(TBIP_PDF_FRAME_END);
 
-	ring = tb_ring_alloc_rx(xd->tb->nhi, -1, TBNET_RING_SIZE, flags,
+	ring = tb_ring_alloc_rx(xd->tb->nhi, -1, net->rx_ring.size, flags,
 				net->tx_ring.ring->hop, sof_mask,
 				eof_mask, tbnet_start_poll, net);
 	if (!ring) {
@@ -963,7 +986,8 @@ static int tbnet_open(struct net_device *dev)
 		tb_xdomain_release_out_hopid(xd, hopid);
 		tb_ring_free(net->tx_ring.ring);
 		net->tx_ring.ring = NULL;
-		return -ENOMEM;
+		ret = -ENOMEM;
+		goto err_free_rx_frames;
 	}
 	net->rx_ring.ring = ring;
 
@@ -988,6 +1012,14 @@ err_free_rx_ring:
 	tb_xdomain_release_out_hopid(xd, hopid);
 	tb_ring_free(net->tx_ring.ring);
 	net->tx_ring.ring = NULL;
+err_free_rx_frames:
+	kfree(net->rx_ring.frames);
+	net->rx_ring.frames = NULL;
+	net->rx_ring.size = 0;
+err_free_tx_frames:
+	kfree(net->tx_ring.frames);
+	net->tx_ring.frames = NULL;
+	net->tx_ring.size = 0;
 	return ret;
 }
 
@@ -1002,10 +1034,16 @@ static int tbnet_stop(struct net_device *dev)
 
 	tb_ring_free(net->rx_ring.ring);
 	net->rx_ring.ring = NULL;
+	kfree(net->rx_ring.frames);
+	net->rx_ring.frames = NULL;
+	net->rx_ring.size = 0;
 
 	tb_xdomain_release_out_hopid(net->xd, net->local_transmit_path);
 	tb_ring_free(net->tx_ring.ring);
 	net->tx_ring.ring = NULL;
+	kfree(net->tx_ring.frames);
+	net->tx_ring.frames = NULL;
+	net->tx_ring.size = 0;
 
 	return 0;
 }
@@ -1322,11 +1360,73 @@ static int tbnet_set_coalesce(struct net_device *dev,
 	return 0;
 }
 
+static void tbnet_get_ringparam(struct net_device *dev,
+				struct ethtool_ringparam *ering,
+				struct kernel_ethtool_ringparam *kernel_ering,
+				struct netlink_ext_ack *extack)
+{
+	struct tbnet *net = netdev_priv(dev);
+
+	ering->rx_max_pending = TBNET_MAX_RING_SIZE;
+	ering->tx_max_pending = TBNET_MAX_RING_SIZE;
+	ering->rx_pending = net->rx_ring_size;
+	ering->tx_pending = net->tx_ring_size;
+}
+
+static int tbnet_validate_ring_size(u32 size, struct netlink_ext_ack *extack)
+{
+	if (size < TBNET_MIN_RING_SIZE || size > TBNET_MAX_RING_SIZE) {
+		NL_SET_ERR_MSG_MOD(extack, "ring size is outside supported range");
+		return -EINVAL;
+	}
+
+	if (!is_power_of_2(size)) {
+		NL_SET_ERR_MSG_MOD(extack, "ring size must be a power of two");
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
+static int tbnet_set_ringparam(struct net_device *dev,
+			       struct ethtool_ringparam *ering,
+			       struct kernel_ethtool_ringparam *kernel_ering,
+			       struct netlink_ext_ack *extack)
+{
+	struct tbnet *net = netdev_priv(dev);
+	int ret;
+
+	if (ering->rx_mini_pending || ering->rx_jumbo_pending) {
+		NL_SET_ERR_MSG_MOD(extack, "mini and jumbo rings are not supported");
+		return -EINVAL;
+	}
+
+	if (netif_running(dev)) {
+		NL_SET_ERR_MSG_MOD(extack,
+				   "ring size can be changed only while the interface is down");
+		return -EBUSY;
+	}
+
+	ret = tbnet_validate_ring_size(ering->rx_pending, extack);
+	if (ret)
+		return ret;
+
+	ret = tbnet_validate_ring_size(ering->tx_pending, extack);
+	if (ret)
+		return ret;
+
+	net->rx_ring_size = ering->rx_pending;
+	net->tx_ring_size = ering->tx_pending;
+	return 0;
+}
+
 static const struct ethtool_ops tbnet_ethtool_ops = {
 	.supported_coalesce_params = ETHTOOL_COALESCE_RX_USECS |
 				     ETHTOOL_COALESCE_TX_USECS,
 	.get_coalesce = tbnet_get_coalesce,
 	.set_coalesce = tbnet_set_coalesce,
+	.get_ringparam = tbnet_get_ringparam,
+	.set_ringparam = tbnet_set_ringparam,
 };
 
 static void tbnet_generate_mac(struct net_device *dev)
@@ -1405,6 +1505,8 @@ static int tbnet_probe(struct tb_service *svc, const struct tb_service_id *id)
 	net->handler.uuid = &tbnet_svc_uuid;
 	net->handler.callback = tbnet_handle_packet;
 	net->handler.data = net;
+	net->rx_ring_size = TBNET_DEFAULT_RING_SIZE;
+	net->tx_ring_size = TBNET_DEFAULT_RING_SIZE;
 	net->int_coalesce_usecs = TBNET_DEFAULT_INT_COALESCE_USECS;
 	tb_register_protocol_handler(&net->handler);
 
