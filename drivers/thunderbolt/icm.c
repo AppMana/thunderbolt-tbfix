@@ -75,6 +75,26 @@ module_param(software_pcie_tunnel_rescan_delay, uint, 0444);
 MODULE_PARM_DESC(software_pcie_tunnel_rescan_delay,
 		 "fallback PCIe bus rescan delay in milliseconds (default: 1500)");
 
+static bool native_pcie_hotplug_rescan = true;
+module_param(native_pcie_hotplug_rescan, bool, 0444);
+MODULE_PARM_DESC(native_pcie_hotplug_rescan,
+		 "rescan native PCIe hotplug bridges that have link but no child device (default: true)");
+
+static bool native_pcie_hotplug_reclaim_empty = true;
+module_param(native_pcie_hotplug_reclaim_empty, bool, 0444);
+MODULE_PARM_DESC(native_pcie_hotplug_reclaim_empty,
+		 "release windows from empty inactive sibling bridges before native hotplug rescan (default: true)");
+
+static unsigned int native_pcie_hotplug_rescan_delay = 5000;
+module_param(native_pcie_hotplug_rescan_delay, uint, 0444);
+MODULE_PARM_DESC(native_pcie_hotplug_rescan_delay,
+		 "native PCIe hotplug rescan delay in milliseconds (default: 5000)");
+
+static unsigned int native_pcie_hotplug_rescan_retries = 6;
+module_param(native_pcie_hotplug_rescan_retries, uint, 0444);
+MODULE_PARM_DESC(native_pcie_hotplug_rescan_retries,
+		 "native PCIe hotplug delayed rescan retries while link is active and bus is empty (default: 6)");
+
 /**
  * struct usb4_switch_nvm_auth - Holds USB4 NVM_AUTH status
  * @reply: Reply from ICM firmware is placed here
@@ -103,8 +123,10 @@ struct usb4_switch_nvm_auth {
  * @proto_version: Firmware protocol version
  * @last_nvm_auth: Last USB4 router NVM_AUTH result (or %NULL if not set)
  * @tunnel_list: Software-created diagnostic tunnels
- * @pcie_rescan_work: Diagnostic delayed PCIe rescan work
+ * @pcie_rescan_work: Delayed PCIe rescan work
  * @pcie_rescan_bridge: Bridge whose subordinate bus should be rescanned
+ * @pcie_rescan_retries: Remaining retries for delayed PCIe rescan work
+ * @pcie_rescan_reclaim_empty: Reclaim empty sibling bridge windows first
  * @veto: Is RTD3 veto in effect
  * @is_supported: Checks if we can support ICM on this controller
  * @cio_reset: Trigger CIO reset
@@ -133,6 +155,8 @@ struct icm {
 	struct list_head tunnel_list;
 	struct delayed_work pcie_rescan_work;
 	struct pci_dev *pcie_rescan_bridge;
+	unsigned int pcie_rescan_retries;
+	bool pcie_rescan_reclaim_empty;
 	bool veto;
 	bool (*is_supported)(struct tb *tb);
 	int (*cio_reset)(struct tb *tb);
@@ -244,6 +268,8 @@ static inline u64 get_parent_route(u64 route)
 static int icm_disconnect_pcie_tunnel(struct tb *tb, struct tb_switch *sw);
 static void icm_disconnect_pcie_tunnels(struct tb *tb);
 static void icm_cancel_pcie_rescan(struct icm *icm);
+static void icm_schedule_native_pcie_hotplug_rescan(struct tb *tb,
+						    struct tb_switch *sw);
 
 static int pci2cio_wait_completion(struct icm *icm, unsigned long timeout_msec)
 {
@@ -935,8 +961,11 @@ icm_fr_device_connected(struct tb *tb, const struct icm_pkg_header *hdr)
 					     TB_LINK_WIDTH_SINGLE;
 		sw->rpm = intel_vss_is_rtd3(pkg->ep_name, sizeof(pkg->ep_name));
 
-		if (add_switch(parent_sw, sw))
+		ret = add_switch(parent_sw, sw);
+		if (ret)
 			tb_switch_put(sw);
+		else if (authorized)
+			icm_schedule_native_pcie_hotplug_rescan(tb, sw);
 	}
 
 	pm_runtime_mark_last_busy(&parent_sw->dev);
@@ -1226,30 +1255,229 @@ static struct pci_dev *icm_find_pcie_bridge(struct tb *tb, struct tb_port *down)
 	return NULL;
 }
 
+static bool icm_pcie_bridge_link_active(struct pci_dev *bridge);
+
+static bool icm_pcie_bridge_presence_detected(struct pci_dev *bridge)
+{
+	u16 flags, sltsta;
+
+	if (!bridge || !pci_is_pcie(bridge))
+		return false;
+
+	if (pcie_capability_read_word(bridge, PCI_EXP_FLAGS, &flags))
+		return true;
+	if (!(flags & PCI_EXP_FLAGS_SLOT))
+		return true;
+	if (pcie_capability_read_word(bridge, PCI_EXP_SLTSTA, &sltsta))
+		return true;
+
+	return sltsta & PCI_EXP_SLTSTA_PDS;
+}
+
+static bool icm_pcie_bridge_has_devices_locked(struct pci_dev *bridge)
+{
+	return bridge && bridge->subordinate &&
+	       !list_empty(&bridge->subordinate->devices);
+}
+
+struct icm_empty_pcie_bridge_match {
+	struct pci_dev *candidate;
+};
+
+static int icm_match_empty_pcie_bridge(struct pci_dev *pdev, void *data)
+{
+	struct icm_empty_pcie_bridge_match *match = data;
+
+	if (!pci_is_pcie(pdev))
+		return 0;
+	if (pci_pcie_type(pdev) != PCI_EXP_TYPE_DOWNSTREAM)
+		return 0;
+	if (!pdev->subordinate)
+		return 0;
+	if (pdev->is_pciehp)
+		return 0;
+	if (icm_pcie_bridge_has_devices_locked(pdev))
+		return 0;
+	if (!icm_pcie_bridge_link_active(pdev))
+		return 0;
+	if (!icm_pcie_bridge_presence_detected(pdev))
+		return 0;
+
+	/*
+	 * pci_walk_bus() walks parent bridges before their children. Keep the
+	 * last match so a Thunderbolt endpoint switch port wins over the outer
+	 * host hotplug bridge that merely contains the switch.
+	 */
+	pci_dev_put(match->candidate);
+	match->candidate = pci_dev_get(pdev);
+	return 0;
+}
+
+static struct pci_dev *icm_find_empty_pcie_bridge(struct tb *tb)
+{
+	struct icm_empty_pcie_bridge_match match = {};
+	struct pci_dev *upstream;
+
+	upstream = pci_upstream_bridge(tb->nhi->pdev);
+	while (upstream) {
+		if (!pci_is_pcie(upstream))
+			return NULL;
+		if (pci_pcie_type(upstream) == PCI_EXP_TYPE_UPSTREAM)
+			break;
+		upstream = pci_upstream_bridge(upstream);
+	}
+
+	if (!upstream || !upstream->subordinate)
+		return NULL;
+
+	pci_walk_bus(upstream->subordinate, icm_match_empty_pcie_bridge,
+		     &match);
+	if (match.candidate)
+		dev_info(&match.candidate->dev,
+			 "tbfix: selected empty link-active present non-pciehp Thunderbolt PCIe bridge for delayed rescan\n");
+
+	return match.candidate;
+}
+
+static void icm_release_empty_sibling_bridge_resources(struct pci_dev *bridge)
+{
+	struct pci_dev *pdev;
+
+	if (!bridge || !bridge->bus)
+		return;
+
+	for_each_pci_bridge(pdev, bridge->bus) {
+		bool released = false;
+		int i;
+		u16 cmd;
+
+		if (pdev == bridge)
+			continue;
+		if (!pci_is_pcie(pdev))
+			continue;
+		if (pci_pcie_type(pdev) != PCI_EXP_TYPE_DOWNSTREAM)
+			continue;
+		if (!pdev->subordinate)
+			continue;
+		if (icm_pcie_bridge_has_devices_locked(pdev))
+			continue;
+		if (icm_pcie_bridge_presence_detected(pdev))
+			continue;
+
+		for (i = PCI_BRIDGE_RESOURCES; i < PCI_BRIDGE_RESOURCE_END; i++) {
+			struct resource *res = &pdev->resource[i];
+
+			if (!(res->flags & (IORESOURCE_IO | IORESOURCE_MEM)))
+				continue;
+			if (res == bridge->subordinate->resource[0] ||
+			    res == bridge->subordinate->resource[1] ||
+			    res == bridge->subordinate->resource[2])
+				continue;
+			if (!res->parent || res->child)
+				continue;
+
+			dev_info(&pdev->dev,
+				 "tbfix: releasing empty non-present sibling bridge window %pR for Thunderbolt PCIe rescan\n",
+				 res);
+			pci_release_resource(pdev, i);
+			released = true;
+		}
+
+		if (!released)
+			continue;
+
+		/*
+		 * pci_release_resource() updates the kernel resource tree but
+		 * does not rewrite bridge window registers. Disable decoding on
+		 * this empty inactive sibling so the reclaimed range cannot
+		 * overlap the active storage bridge until pciehp configures it.
+		 */
+		if (!pci_read_config_word(pdev, PCI_COMMAND, &cmd))
+			pci_write_config_word(pdev, PCI_COMMAND,
+					      cmd & ~(PCI_COMMAND_IO |
+						      PCI_COMMAND_MEMORY));
+	}
+}
+
+static bool icm_rescan_pcie_bridge(struct pci_dev *bridge, bool reclaim_empty)
+{
+	unsigned int max;
+	bool found;
+
+	if (!bridge || !bridge->subordinate) {
+		if (bridge)
+			dev_warn(&bridge->dev,
+				 "tbfix: no subordinate bus for delayed Thunderbolt PCIe rescan\n");
+		return false;
+	}
+
+	pci_lock_rescan_remove();
+	if (reclaim_empty)
+		icm_release_empty_sibling_bridge_resources(bridge);
+
+	max = pci_scan_child_bus(bridge->subordinate);
+	pci_assign_unassigned_bridge_resources(bridge);
+	pcie_bus_configure_settings(bridge->subordinate);
+	pci_bus_add_devices(bridge->subordinate);
+
+	found = icm_pcie_bridge_has_devices_locked(bridge);
+	pci_unlock_rescan_remove();
+
+	dev_info(&bridge->dev,
+		 "tbfix: delayed Thunderbolt PCIe bridge rescan found %u buses/devices, child_present=%u\n",
+		 max, found);
+
+	return found;
+}
+
 static void icm_pcie_rescan_work(struct work_struct *work)
 {
 	struct icm *icm = container_of(to_delayed_work(work), struct icm,
 				      pcie_rescan_work);
 	struct pci_dev *bridge;
-	unsigned int found;
+	unsigned int retries;
+	bool found, reclaim_empty;
 
 	mutex_lock(&icm->request_lock);
 	bridge = pci_dev_get(icm->pcie_rescan_bridge);
+	retries = icm->pcie_rescan_retries;
+	reclaim_empty = icm->pcie_rescan_reclaim_empty;
 	mutex_unlock(&icm->request_lock);
 
 	if (!bridge)
 		return;
 
-	if (!bridge->subordinate) {
-		dev_warn(&bridge->dev, "tbfix: no subordinate bus for delayed Thunderbolt PCIe rescan\n");
-		goto out;
+	pm_runtime_get_sync(&bridge->dev);
+	found = icm_rescan_pcie_bridge(bridge, reclaim_empty);
+	pm_runtime_mark_last_busy(&bridge->dev);
+	pm_runtime_put_autosuspend(&bridge->dev);
+
+	if (!found && retries && icm_pcie_bridge_link_active(bridge)) {
+		mutex_lock(&icm->request_lock);
+		if (icm->pcie_rescan_bridge == bridge) {
+			icm->pcie_rescan_retries = retries - 1;
+			mutex_unlock(&icm->request_lock);
+
+			dev_info(&bridge->dev,
+				 "tbfix: Thunderbolt PCIe bridge still empty, retrying rescan (%u left)\n",
+				 retries - 1);
+			mod_delayed_work(system_wq, &icm->pcie_rescan_work,
+					 msecs_to_jiffies(native_pcie_hotplug_rescan_delay));
+			goto out_put_bridge;
+		}
+		mutex_unlock(&icm->request_lock);
 	}
 
-	found = pci_rescan_bus(bridge->subordinate);
-	dev_info(&bridge->dev, "tbfix: delayed Thunderbolt PCIe bus rescan found %u buses/devices\n",
-		 found);
+	mutex_lock(&icm->request_lock);
+	if (icm->pcie_rescan_bridge == bridge) {
+		icm->pcie_rescan_bridge = NULL;
+		icm->pcie_rescan_retries = 0;
+		icm->pcie_rescan_reclaim_empty = false;
+		pci_dev_put(bridge);
+	}
+	mutex_unlock(&icm->request_lock);
 
-out:
+out_put_bridge:
 	pci_dev_put(bridge);
 }
 
@@ -1259,12 +1487,34 @@ static void icm_cancel_pcie_rescan(struct icm *icm)
 	mutex_lock(&icm->request_lock);
 	pci_dev_put(icm->pcie_rescan_bridge);
 	icm->pcie_rescan_bridge = NULL;
+	icm->pcie_rescan_retries = 0;
+	icm->pcie_rescan_reclaim_empty = false;
 	mutex_unlock(&icm->request_lock);
+}
+
+static void icm_schedule_pcie_rescan_bridge(struct tb *tb, struct pci_dev *bridge,
+					    unsigned int delay,
+					    unsigned int retries,
+					    bool reclaim_empty)
+{
+	struct icm *icm = tb_priv(tb);
+
+	mutex_lock(&icm->request_lock);
+	pci_dev_put(icm->pcie_rescan_bridge);
+	icm->pcie_rescan_bridge = pci_dev_get(bridge);
+	icm->pcie_rescan_retries = retries;
+	icm->pcie_rescan_reclaim_empty = reclaim_empty;
+	mutex_unlock(&icm->request_lock);
+
+	dev_info(&bridge->dev,
+		 "tbfix: scheduling delayed Thunderbolt PCIe bridge rescan in %u ms (retries %u, reclaim_empty %u)\n",
+		 delay, retries, reclaim_empty);
+	mod_delayed_work(system_wq, &icm->pcie_rescan_work,
+			 msecs_to_jiffies(delay));
 }
 
 static void icm_schedule_pcie_rescan(struct tb *tb, struct tb_port *down)
 {
-	struct icm *icm = tb_priv(tb);
 	struct pci_dev *bridge;
 
 	if (!software_pcie_tunnel_rescan)
@@ -1276,15 +1526,10 @@ static void icm_schedule_pcie_rescan(struct tb *tb, struct tb_port *down)
 		return;
 	}
 
-	mutex_lock(&icm->request_lock);
-	pci_dev_put(icm->pcie_rescan_bridge);
-	icm->pcie_rescan_bridge = bridge;
-	mutex_unlock(&icm->request_lock);
-
-	dev_info(&bridge->dev, "tbfix: scheduling delayed Thunderbolt PCIe bus rescan in %u ms\n",
-		 software_pcie_tunnel_rescan_delay);
-	mod_delayed_work(system_wq, &icm->pcie_rescan_work,
-			 msecs_to_jiffies(software_pcie_tunnel_rescan_delay));
+	icm_schedule_pcie_rescan_bridge(tb, bridge,
+					software_pcie_tunnel_rescan_delay, 0,
+					false);
+	pci_dev_put(bridge);
 }
 
 static bool icm_pcie_bridge_has_devices(struct pci_dev *bridge)
@@ -1312,6 +1557,26 @@ static bool icm_pcie_bridge_link_active(struct pci_dev *bridge)
 		return false;
 
 	return lnksta & PCI_EXP_LNKSTA_DLLLA;
+}
+
+static void icm_schedule_native_pcie_hotplug_rescan(struct tb *tb,
+						    struct tb_switch *sw)
+{
+	struct pci_dev *bridge;
+
+	if (!native_pcie_hotplug_rescan)
+		return;
+
+	bridge = icm_find_empty_pcie_bridge(tb);
+	if (!bridge)
+		return;
+
+	icm_schedule_pcie_rescan_bridge(tb, bridge,
+					native_pcie_hotplug_rescan_delay,
+					native_pcie_hotplug_rescan_retries,
+					native_pcie_hotplug_reclaim_empty);
+
+	pci_dev_put(bridge);
 }
 
 static bool icm_pcie_subtree_present(struct tb *tb, struct tb_switch *sw)
@@ -1787,6 +2052,8 @@ __icm_tr_device_connected(struct tb *tb, const struct icm_pkg_header *hdr,
 				if (!ret)
 					sw->authorized = true;
 			}
+		} else if (!ret && authorized) {
+			icm_schedule_native_pcie_hotplug_rescan(tb, sw);
 		}
 	}
 
