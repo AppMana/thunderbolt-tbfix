@@ -150,6 +150,16 @@ docker run --rm -v "$PWD:/work" -w /work ubuntu:24.04 \
   bash tools/ci/distro-install.sh 'dist/thunderbolt-tbfix-dkms_*.deb'
 ```
 
+The container install check verifies the `.deb` metadata and `/usr/src`
+staging. It does not compile the module by default because this tbfix branch is
+for the fleet's 6.17 Thunderbolt tree, while stock Ubuntu 24.04 containers
+install 6.8 headers. To compile in a matching kernel-header environment:
+
+```bash
+TBFIX_VERIFY_DKMS_BUILD=1 tools/ci/distro-install.sh \
+  'dist/thunderbolt-tbfix-dkms_*.deb'
+```
+
 Functional tests:
 
 ```bash
