@@ -27,8 +27,12 @@ artefact="$(realpath "${artefacts[0]}")"
 
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
+headers_pkg=linux-headers-amd64
+if grep -qi '^ID=ubuntu' /etc/os-release; then
+	headers_pkg=linux-headers-generic
+fi
 apt-get install -y -qq --no-install-recommends \
-	build-essential ca-certificates dkms file kmod linux-headers-amd64 make
+	build-essential ca-certificates dkms file kmod "$headers_pkg" make
 apt-get install -y -qq "$artefact"
 
 modname=thunderbolt-tbfix

@@ -42,7 +42,55 @@ Read `docs/thunderbolt_fix.md` in the parent `appmana` repo. It covers:
 6. Rebasing on a newer kernel when the fleet bumps.
 7. Preparing upstream topic patches for manual review.
 
-## Debian / Ubuntu package
+## Install on Ubuntu
+
+### From the AppMana apt repository
+
+Once `AppMana/apt` has published the release, install with:
+
+```bash
+curl -fsSL https://appmana.github.io/apt/appmana-archive-keyring.gpg \
+  | sudo gpg --dearmor -o /usr/share/keyrings/appmana-archive-keyring.gpg
+
+echo 'deb [arch=amd64 signed-by=/usr/share/keyrings/appmana-archive-keyring.gpg] https://appmana.github.io/apt noble main' \
+  | sudo tee /etc/apt/sources.list.d/appmana.list
+
+sudo apt update
+sudo apt install thunderbolt-tbfix-dkms
+```
+
+### From GitHub Releases
+
+Download `thunderbolt-tbfix-dkms_<version>_all.deb` from:
+
+```text
+https://github.com/AppMana/thunderbolt-tbfix/releases
+```
+
+Then install it:
+
+```bash
+sudo apt install build-essential dkms kmod make "linux-headers-$(uname -r)"
+sudo apt install ./thunderbolt-tbfix-dkms_<version>_all.deb
+dkms status -m thunderbolt-tbfix
+```
+
+The package stages source under `/usr/src/thunderbolt-tbfix-<version>` and
+runs `dkms autoinstall`. It intentionally does not reload `thunderbolt` or
+`thunderbolt_net`; fleet reload ordering remains owned by Ansible or an
+explicit maintenance command.
+
+Verify the installed module path:
+
+```bash
+modinfo thunderbolt | sed -n '1,8p'
+modinfo thunderbolt_net | sed -n '1,8p'
+```
+
+`filename` should point under `/lib/modules/<kernel>/updates/`, not the
+stock `/kernel/drivers/...` tree.
+
+## Build a Debian package
 
 Build the DKMS `.deb` locally:
 
@@ -51,14 +99,100 @@ tools/ci/distro-package.sh ubuntu
 ```
 
 The artifact is written to `dist/thunderbolt-tbfix-dkms_<version>_all.deb`.
-Installing it stages the DKMS source under
-`/usr/src/thunderbolt-tbfix-<version>` and runs `dkms autoinstall`.
-The package intentionally does not reload `thunderbolt` or
-`thunderbolt_net`; fleet reload ordering remains owned by Ansible.
-
 Tags matching `v*` publish the `.deb` and its `.sha256` file to GitHub
 Releases in `AppMana/thunderbolt-tbfix`. The public apt repository in
 `AppMana/apt` consumes those release assets.
+
+## Development process
+
+Install build and test dependencies on an Ubuntu development host:
+
+```bash
+sudo apt update
+sudo apt install build-essential dkms git kmod "linux-headers-$(uname -r)" \
+  linux-tools-common linux-tools-generic trace-cmd
+```
+
+Fast one-host edit/build loop:
+
+```bash
+scripts/oot-build.sh
+scripts/oot-build.sh --install
+```
+
+`--install` writes the freshly built modules to
+`/lib/modules/$(uname -r)/updates/` and runs `depmod`. To live-swap on a
+test host:
+
+```bash
+scripts/oot-build.sh --swap
+```
+
+Do not run `--swap` on a production chain node unless the Thunderbolt link can
+be interrupted. It unloads and reloads `thunderbolt_net` and `thunderbolt`.
+
+DKMS/package loop:
+
+```bash
+tools/ci/distro-package.sh ubuntu
+sudo apt install ./dist/thunderbolt-tbfix-dkms_<version>_all.deb
+sudo dkms build -m thunderbolt-tbfix -v <version> -k "$(uname -r)" --force
+sudo dkms install -m thunderbolt-tbfix -v <version> -k "$(uname -r)" --force
+```
+
+Container verification, without touching host modules:
+
+```bash
+docker run --rm -v "$PWD:/work" -w /work ubuntu:24.04 \
+  bash tools/ci/distro-package.sh ubuntu
+
+docker run --rm -v "$PWD:/work" -w /work ubuntu:24.04 \
+  bash tools/ci/distro-install.sh 'dist/thunderbolt-tbfix-dkms_*.deb'
+```
+
+Functional tests:
+
+```bash
+tests/run-smoke.sh
+tests/run-durability.sh
+```
+
+`run-smoke.sh` is the quick gate. `run-durability.sh` is the wedge gate and
+should complete the 192 GiB allreduce target before fleet rollout.
+
+Tracing and diagnostics:
+
+```bash
+sudo mount -t tracefs nodev /sys/kernel/tracing 2>/dev/null || true
+sudo trace-cmd list | grep -Ei 'thunderbolt|tbnet|nhi|irq'
+sudo trace-cmd record -e thunderbolt:* -e napi:* -e irq:* -- sleep 30
+sudo trace-cmd report | less
+```
+
+Useful live checks:
+
+```bash
+sudo dmesg -T | grep -Ei 'thunderbolt|tb-ch|DMA paths|login|host found' | tail -100
+ls -l /sys/bus/thunderbolt/devices
+for d in /sys/bus/thunderbolt/devices/*; do
+  [ -e "$d" ] || continue
+  echo "== $d =="
+  for f in device_name unique_id rx_speed tx_speed rx_lanes tx_lanes authorized; do
+    [ -r "$d/$f" ] && echo "$f=$(cat "$d/$f")"
+  done
+done
+ip -br link | grep -E 'tb-ch|thunderbolt'
+```
+
+For NHI interrupt-mask debugging, inspect Thunderbolt debugfs if available:
+
+```bash
+sudo find /sys/kernel/debug/thunderbolt -maxdepth 3 -type f -print 2>/dev/null
+```
+
+Capture these before and after smoke/durability runs when changing
+`drivers/thunderbolt/nhi.c`, `drivers/thunderbolt/path.c`, or
+`drivers/net/thunderbolt/main.c`.
 
 ## Branches
 
