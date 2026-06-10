@@ -18,9 +18,13 @@ base      = v6.17 + 3 backports already in linux-hwe-6.17
 drivers/thunderbolt/        full subsystem source (patched)
 drivers/net/thunderbolt/    tbnet driver source (patched)
 dkms/                       DKMS scaffolding (dkms.conf, Makefile)
+packaging/debian/           Debian package metadata for thunderbolt-tbfix-dkms
 scripts/
   oot-build.sh              fast iteration: stage at ~/src/tb-oot, build, hot-swap
   export-dkms-payload.sh    write byte-identical DKMS bundle into the appmana repo
+tools/ci/
+  distro-package.sh         build thunderbolt-tbfix-dkms_<version>_all.deb
+  distro-install.sh         verify the .deb can build through DKMS
 tests/
   run-smoke.sh              60-s NCCL hostnet sweep on the 3-node chain
   run-durability.sh         192 GiB allreduce reproducer (~30 min, the wedge gate)
@@ -37,6 +41,24 @@ Read `docs/thunderbolt_fix.md` in the parent `appmana` repo. It covers:
 5. Reverting to in-tree drivers.
 6. Rebasing on a newer kernel when the fleet bumps.
 7. Preparing upstream topic patches for manual review.
+
+## Debian / Ubuntu package
+
+Build the DKMS `.deb` locally:
+
+```bash
+tools/ci/distro-package.sh ubuntu
+```
+
+The artifact is written to `dist/thunderbolt-tbfix-dkms_<version>_all.deb`.
+Installing it stages the DKMS source under
+`/usr/src/thunderbolt-tbfix-<version>` and runs `dkms autoinstall`.
+The package intentionally does not reload `thunderbolt` or
+`thunderbolt_net`; fleet reload ordering remains owned by Ansible.
+
+Tags matching `v*` publish the `.deb` and its `.sha256` file to GitHub
+Releases in `AppMana/thunderbolt-tbfix`. The public apt repository in
+`AppMana/apt` consumes those release assets.
 
 ## Branches
 
